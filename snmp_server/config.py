@@ -1,7 +1,7 @@
 # SNMP server response config example
 
-def my_response(oid):
-	res = '|'.join(oid.split('.'))
+def my_response(params):
+	res = '|'.join(params.oid.split('.'))
 	return octet_string('response: {}'.format(res))
 
 
@@ -16,9 +16,9 @@ DATA = {
     # integer enumeration
     '1.3.6.1.4.1.1.8.0': integer(1, enum=[1, 2, 3]),
     # notice the wildcards in the next OIDs:
-    '1.3.6.1.4.1.1.?.0': lambda oid: octet_string('? {}'.format(oid)),
-    '1.3.6.1.4.1.2.*': lambda oid: octet_string('* {}'.format(oid)),
+    '1.3.6.1.4.1.1.?.0': lambda f: octet_string('? {}'.format(f.oid)),
+    '1.3.6.1.4.1.2.*': lambda f: octet_string('* {}'.format(f.oid)),
     # lambda or function, with single oid argument, can be used for response generation
     '1.3.6.1.4.1.1001.1.0': my_response,
-    '1.3.6.1.4.1.1002.1.0': lambda oid: octet_string('-'.join(oid.split('.'))),
+    '1.3.6.1.4.1.1002.1.0': lambda f: octet_string('-'.join(f.oid.split('.'))),
 }

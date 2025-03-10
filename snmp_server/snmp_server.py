@@ -128,6 +128,16 @@ class WrongValueError(Exception):
     """Raise when wrong value (e.g. value not in available range) error occurred"""
 
 
+class FunctionParams:
+    oid = ""
+    set_value = ""
+    host = ""
+    trap_details = {}
+
+    def encode(self, *args):
+        return self.oid.encode(*args)
+
+
 def encode_to_7bit(value):
     """Encode to 7 bit"""
     if value > 0x7f:
@@ -557,6 +567,16 @@ def _parse_snmp_asn1(stream):
         pdu_index += 1
 
 
+def _format_oid_value(oid_value, function_params):
+    # if oid value is a function - call it to get the value
+    if isinstance(oid_value, types.FunctionType):
+        return oid_value(function_params)
+    if isinstance(oid_value, tuple):
+        return oid_value[0]
+    else:
+        return oid_value
+
+
 def get_next_oid(oid):
     """Get the next OID parent's node"""
     # increment pre last node, e.g.: "1.3.6.1.1" -> "1.3.6.2.1"
@@ -764,21 +784,21 @@ def parse_config(filename):
     return oids
 
 
-def find_oid_and_value_with_wildcard(oids, oid):
+def find_oid_and_value_with_wildcard(oids, function_params):
     """Find OID and OID value with wildcards"""
     wildcard_keys = [x for x in oids.keys() if '*' in x or '?' in x]
     out = []
     for wck in wildcard_keys:
-        if fnmatch.filter([oid], wck):
-            value = oids[wck](oid)
+        if fnmatch.filter([function_params.oid], wck):
+            value = _format_oid_value(oids[wck], function_params)
             out.append((wck, value,))
     return out
 
-
-def handle_get_request(oids, oid):
+def handle_get_request(oids, function_params):
     """Handle GetRequest PDU"""
     error_status = ASN1_ERROR_STATUS_NO_ERROR
     error_index = 0
+    oid = function_params.oid
     oid_value = null()
     found = oid in oids
     if found:
@@ -788,7 +808,7 @@ def handle_get_request(oids, oid):
             oid_value = struct.pack('BB', ASN1_NO_SUCH_OBJECT, 0)
     else:
         # now check wildcards
-        results = find_oid_and_value_with_wildcard(oids, oid)
+        results = find_oid_and_value_with_wildcard(oids, function_params)
         if len(results) > 1:
             logger.warning('Several results found with wildcards for OID: %s', oid)
         if results:
@@ -800,13 +820,15 @@ def handle_get_request(oids, oid):
         error_index = 1
         # TODO: check this
         oid_value = struct.pack('BB', ASN1_NO_SUCH_INSTANCE, 0)
-    return error_status, error_index, oid_value
+
+    return error_status, error_index, _format_oid_value(oid_value, function_params)
 
 
-def handle_get_next_request(oids, oid, limit_to_last_in_config=True):
+def handle_get_next_request(oids, function_params, limit_to_last_in_config=True):
     """Handle GetNextRequest"""
     error_status = ASN1_ERROR_STATUS_NO_ERROR
     error_index = 0
+    oid = function_params.oid
     if oid in oids:
         new_oid = get_next(oids, oid)
         if not new_oid:
@@ -815,7 +837,7 @@ def handle_get_next_request(oids, oid, limit_to_last_in_config=True):
             oid_value = oids.get(new_oid)
     else:
         # now check wildcards
-        results = find_oid_and_value_with_wildcard(oids, oid)
+        results = find_oid_and_value_with_wildcard(oids, function_params)
         if len(results) > 1:
             logger.warning('Several results found with wildcards for OID: %s', oid)
         if results:
@@ -840,14 +862,17 @@ def handle_get_next_request(oids, oid, limit_to_last_in_config=True):
         last_oid_in_config = sorted(oids, key=functools.cmp_to_key(oid_cmp))[-1]
         if oid_cmp(final_oid, last_oid_in_config) > 0:
             oid_value = struct.pack('BB', ASN1_END_OF_MIB_VIEW, 0)
-    return error_status, error_index, final_oid, oid_value
+    return error_status, error_index, final_oid, _format_oid_value(oid_value, function_params)
 
 
-def handle_set_request(oids, oid, type_and_value):
+def handle_set_request(oids, function_params, type_and_value):
     """Handle SetRequest PDU"""
     error_status = ASN1_ERROR_STATUS_NO_ERROR
     error_index = 0
     value_type, value = type_and_value
+    oid = function_params.oid
+
+    function_params.set_value = value
 
     res = None
     if value_type == 'INTEGER':
@@ -887,17 +912,20 @@ def handle_set_request(oids, oid, type_and_value):
         res = null()
     else:
         if oid in oids and isinstance(oids[oid], types.FunctionType):
-            oids[oid](oid, value)
+            oids[oid](function_params)
         else:
             oids[oid] = res
 
     oid_value = res
     return error_status, error_index, oid_value
 
-def handle_trap_request(oids, oid, type_and_value, details):
+def handle_trap_request(oids, function_params, type_and_value):
     """Handle Trap Request"""
     logger.info(type_and_value)
     value_type, value = type_and_value
+    oid = function_params.oid
+
+    function_params.value = value
 
     res = None
     if value_type == 'INTEGER':
@@ -933,7 +961,7 @@ def handle_trap_request(oids, oid, type_and_value, details):
         
     if res is not None:
         if oid in oids and isinstance(oids[oid], types.FunctionType):
-            oids[oid](oid, value, details)
+            oids[oid](function_params)
         else:
             oids[oid] = res
 
@@ -1005,24 +1033,19 @@ def snmp_server(host, port, oids):
             oid_items = []
             oid_value = null()
 
+            function_params = FunctionParams()
+            function_params.host = host
+
             # handle protocol data units
             if pdu_type == ASN1_GET_REQUEST_PDU:
                 requested_oids = request_result[6:]
                 for _, oid in requested_oids:
-                    _, _, oid_value = handle_get_request(oids, oid)
-                    # if oid value is a function - call it to get the value
-                    if isinstance(oid_value, types.FunctionType):
-                        oid_value = oid_value(oid)
-                    if isinstance(oid_value, tuple):
-                        oid_value = oid_value[0]
+                    function_params.oid = oid
+                    _, _, oid_value = handle_get_request(oids, function_params)
                     oid_items.append((oid_to_bytes(oid), oid_value))
             elif pdu_type == ASN1_GET_NEXT_REQUEST_PDU:
-                oid = request_result[6][1]
-                error_status, error_index, oid, oid_value = handle_get_next_request(oids, oid)
-                if isinstance(oid_value, types.FunctionType):
-                    oid_value = oid_value(oid)
-                if isinstance(oid_value, tuple):
-                    oid_value = oid_value[0]
+                function_params.oid = request_result[6][1]
+                error_status, error_index, oid, oid_value = handle_get_next_request(oids, function_params)
                 oid_items.append((oid_to_bytes(oid), oid_value))
             elif pdu_type == ASN1_GET_BULK_REQUEST_PDU:
                 max_repetitions = request_result[5][1]
@@ -1032,10 +1055,6 @@ def snmp_server(host, port, oids):
                     for idx, val in enumerate(requested_oids):
                         oid = val[1]
                         error_status, error_index, oid, oid_value = handle_get_next_request(oids, oid)
-                        if isinstance(oid_value, types.FunctionType):
-                            oid_value = oid_value(oid)
-                        if isinstance(oid_value, tuple):
-                            oid_value = oid_value[0]
                         oid_items.append((oid_to_bytes(oid), oid_value))
                         requested_oids[idx] = ('OID', oid)
             elif pdu_type == ASN1_SET_REQUEST_PDU:
@@ -1050,7 +1069,8 @@ def snmp_server(host, port, oids):
                         if isinstance(enum_values, Iterable) and new_value not in enum_values:
                             raise WrongValueError('Value {} is outside the range of enum values'.format(new_value))
                     logger.debug('oid: %s, type_and_value: %s', oid, type_and_value)
-                    error_status, error_index, oid_value = handle_set_request(oids, oid, type_and_value)
+                    function_params.oid = oid
+                    error_status, error_index, oid_value = handle_set_request(oids, function_params, type_and_value)
                 except WrongValueError as ex:
                     logger.error(f"Wrong value error: {ex}")
                     error_status = ASN1_ERROR_STATUS_WRONG_VALUE
@@ -1059,11 +1079,6 @@ def snmp_server(host, port, oids):
                     logger.error(f"Unknown exception error: {ex}")
                     error_status = ASN1_ERROR_STATUS_BAD_VALUE
                     error_index = 0
-                # if oid value is a function - call it to get the value
-                if isinstance(oid_value, types.FunctionType):
-                    oid_value = oid_value(oid)
-                if isinstance(oid_value, tuple):
-                    oid_value = oid_value[0]
                 oid_items.append((oid_to_bytes(oid), oid_value))
             elif pdu_type == ASN1_INFORM_REQUEST_PDU:
                 if len(request_result) < 8:
@@ -1075,31 +1090,22 @@ def snmp_server(host, port, oids):
                     oid = requested_oids[i][1]
                     type_and_value = requested_oids[i + 1]
                     error_status, error_index, oid_value = handle_set_request(oids, oid, type_and_value)
-                    if isinstance(oid_value, types.FunctionType):
-                        oid_value = oid_value(oid)
-                    if isinstance(oid_value, tuple):
-                        oid_value = oid_value[0]
                     oid_items.append((oid_to_bytes(oid), oid_value))
             elif pdu_type == ASN1_TRAP_REQUEST_PDU:
                 if len(request_result) < 10:
                     raise Exception('Invalid ASN.1 parsed request length for SNMP trap request!')
                 logger.debug('Trap request length %d', len(request_result))
-                agent_community = request_result[1][1]
-                enterprise_oid = request_result[3][1]
-                agent_addr = request_result[4][1]
-                trap_type = request_result[5][1]
-                specific_type = request_result[6][1]
-                uptime = request_result[7][1]
-                oid = request_result[8][1]
+
+                function_params.trap_details["agent_community"] = request_result[1][1]
+                function_params.trap_details["enterprise_oid"] = request_result[3][1]
+                function_params.trap_details["agent_addr"] = request_result[4][1]
+                function_params.trap_details["trap_type"] = request_result[5][1]
+                function_params.trap_details["specific_type"] = request_result[6][1]
+                function_params.trap_details["uptime"] = request_result[7][1]
+                function_params.oid = request_result[8][1]
                 type_and_value = request_result[9]
-                handle_trap_request(oids, oid, type_and_value, {
-                    'agent_community': agent_community,
-                    'enterprise_oid': enterprise_oid,
-                    'agent_addr': agent_addr,
-                    'trap_type': trap_type,
-                    'specific_type': specific_type,
-                    'uptime': uptime,
-                })
+
+                handle_trap_request(oids, function_params, type_and_value)
                 continue # traps do not require a response
             else:
                 continue
