@@ -16,7 +16,7 @@ import struct
 import sys
 import types
 from contextlib import closing
-from multiprocessing import Pool
+from threading import Event, Thread
 from functools import partial
 
 try:
@@ -1002,16 +1002,23 @@ def craft_response(version, community, request_id, error_status, error_index, oi
     return response
 
 
-def snmp_server(host, port, oids):
+def snmp_server(host, port, oids, terminate_event):
     """Main SNMP server loop"""
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(10)
         sock.bind((host, port))
-        print('SNMP server listening on {}:{}'.format(host, port))
+        logger.info('SNMP server listening on {}:{}'.format(host, port))
 
         # SNMP server main loop
-        while True:
-            request_data, address = sock.recvfrom(4096)
+        while not terminate_event.is_set():
+
+            try:
+                request_data, address = sock.recvfrom(4096)
+            except TimeoutError:
+                logger.debug('Thread for %s is alive', host)
+                continue
+
             logger.debug('Received %d bytes from %s', len(request_data), address)
 
             request_stream = StringIO(request_data.decode('latin'))
@@ -1125,8 +1132,16 @@ def snmp_server(host, port, oids):
                 logger.error('Failed to send %d bytes of response: %s', len(response), ex)
             logger.debug('')
 
-def start_server(host):
-    snmp_server(host, port, oids)
+
+def start_server(host, port, oids, terminate_event):
+    try:
+        snmp_server(host, port, oids, terminate_event)
+    except KeyboardInterrupt:
+        logger.debug('Interrupted by Ctrl+C')
+        terminate_event.set()
+    except Exception:
+        logging.exception("")
+        terminate_event.set()
 
 
 def main():
@@ -1172,12 +1187,13 @@ def main():
 
     port = args.port
 
-    try:
-        with Pool(len(hosts)) as p:
-            # Start a thread for each binding
-            p.map(start_server, hosts)
-    except KeyboardInterrupt:
-        logger.debug('Interrupted by Ctrl+C')
+    terminate_event = Event()
+    for host in hosts:
+        # Start a process for each binding
+        p = Thread(target=start_server,
+                   args=(host, port, oids, terminate_event))
+        p.start()
+    terminate_event.wait()
 
 
 if __name__ == '__main__':
