@@ -16,6 +16,8 @@ import struct
 import sys
 import types
 from contextlib import closing
+from multiprocessing import Pool
+from functools import partial
 
 try:
     from collections import Iterable
@@ -778,7 +780,8 @@ def parse_config(filename):
             for value in oids.values():
                 if isinstance(value, types.FunctionType) and value.__code__.co_argcount != 1:
                     raise ConfigError('"{}" must have one argument'.format(value.__name__))
-            return oids
+            hosts = out_locals['HOSTS']
+            return oids, hosts
     except Exception as ex:
         raise ConfigError('Config parsing error: {}'.format(ex))
     return oids
@@ -1122,6 +1125,10 @@ def snmp_server(host, port, oids):
                 logger.error('Failed to send %d bytes of response: %s', len(response), ex)
             logger.debug('')
 
+def start_server(host):
+    snmp_server(host, port, oids)
+
+
 def main():
     """Main"""
     parser = argparse.ArgumentParser(description='SNMP server')
@@ -1144,22 +1151,31 @@ def main():
         logger.setLevel(logging.DEBUG)
 
     # work as an echo server if no config is passed
+    global oids, port
     oids = {
         '*': lambda oid: octet_string(oid),
     }
+    hosts = []
+
     # read a config
     config_filename = args.config
     if config_filename:
         try:
-            oids = parse_config(config_filename)
+            oids, hosts = parse_config(config_filename)
         except ConfigError as ex:
             logger.error(ex)
             sys.exit(-1)
 
-    host = '0.0.0.0'
+    # If no hosts are configured, use 0.0.0.0
+    if len(hosts) == 0:
+        hosts = ['0.0.0.0']
+
     port = args.port
+
     try:
-        snmp_server(host, port, oids)
+        with Pool(len(hosts)) as p:
+            # Start a thread for each binding
+            p.map(start_server, hosts)
     except KeyboardInterrupt:
         logger.debug('Interrupted by Ctrl+C')
 

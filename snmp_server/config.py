@@ -22,3 +22,10 @@ DATA = {
     '1.3.6.1.4.1.1001.1.0': my_response,
     '1.3.6.1.4.1.1002.1.0': lambda f: octet_string('-'.join(f.oid.split('.'))),
 }
+
+# One thread will be available for each item in HOSTS.
+# Each thread will bind to this host and it will be available
+# to responses as params.host
+HOSTS = [
+        '0.0.0.0',
+]
